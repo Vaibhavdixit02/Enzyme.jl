@@ -9155,6 +9155,173 @@ end
     return mod, (;adjointf, augmented_primalf, entry=adjointf, compiled=meta.compiled, TapeType)
 end
 
+
+function GPUCompiler.codegen(output::Symbol, job::CompilerJob{<:EnzymeTarget};
+                 libraries::Bool=true, deferred_codegen::Bool=true, optimize::Bool=true, ctx = nothing,
+                 strip::Bool=false, validate::Bool=true, only_entry::Bool=false, parent_job::Union{Nothing, CompilerJob} = nothing)
+    params  = job.config.params
+    expectedTapeType = params.expectedTapeType
+    mode   = params.mode
+    TT = params.TT
+    width = params.width
+    abiwrap = params.abiwrap
+    primal  = job.source
+    modifiedBetween = params.modifiedBetween
+    returnPrimal = params.returnPrimal
+
+    if !(params.rt <: Const)
+        @assert !isghostty(eltype(params.rt))
+    end
+    if parent_job === nothing
+        primal_target = DefaultCompilerTarget()
+        primal_params = PrimalCompilerParams(mode)
+        primal_job    = CompilerJob(primal, CompilerConfig(primal_target, primal_params; kernel=false), job.world)
+    else
+        config2 = CompilerConfig(parent_job.config.target, parent_job.config.params; kernel=false, parent_job.config.entry_abi, parent_job.config.name, parent_job.config.always_inline)
+        primal_job = CompilerJob(primal, config2, job.world) # TODO EnzymeInterp params, etc
+    end
+
+    mod, meta = GPUCompiler.codegen(:llvm, primal_job; optimize=false, cleanup=false, validate=false, parent_job=parent_job, ctx)
+    prepare_llvm(mod, primal_job, meta)
+    inserted_ts = false
+    if ctx !== nothing && ctx isa LLVM.Context
+        @assert ctx == context(mod)
+        ts_ctx = nothing
+    else
+        ts_ctx = ctx
+        ctx = context(mod)
+@static if VERSION < v"1.9-"
+else
+        if !in(ctx, keys(ctxToThreadSafe))
+            ctxToThreadSafe[ctx] = ts_ctx
+            inserted_ts = true
+        end
+end
+    end
+
+    LLVM.ModulePassManager() do pm
+        API.AddPreserveNVVMPass!(pm, #=Begin=#true)
+        run!(pm, mod)
+    end
+
+    primalf = meta.entry
+    check_ir(job, mod)
+
+    @assert actualRetType !== nothing
+
+    source_sig = job.source.specTypes
+    primalf, returnRoots = lowerConvention ? lower_convention(source_sig, mod, primalf, actualRetType) : (primalf, false)
+    push!(function_attributes(primalf), StringAttribute("enzymejl_world", string(job.world); ctx))
+
+    if primal_job.config.target isa GPUCompiler.NativeCompilerTarget
+        target_machine = JIT.get_tm()
+    else
+        target_machine = GPUCompiler.llvm_machine(primal_job.config.target)
+    end
+
+    parallel = Threads.nthreads() > 1
+    process_module = false
+    device_module = false
+    if parent_job !== nothing
+        if parent_job.config.target isa GPUCompiler.PTXCompilerTarget ||
+           parent_job.config.target isa GPUCompiler.GCNCompilerTarget
+            parallel = true
+            device_module = true
+        end
+        if parent_job.config.target isa GPUCompiler.GCNCompilerTarget
+           process_module = true
+        end
+    end
+
+    # annotate
+    annotate!(mod, mode)
+
+    # Run early pipeline
+    optimize!(mod, target_machine)
+
+    if process_module
+        GPUCompiler.optimize_module!(parent_job, mod)
+    end
+
+    TapeType::Type = Cvoid
+
+    logic = Logic()
+    mode = API.DEM_Trace
+    autodiff = false
+    #   // user implemented
+
+  llvm::Function *getChoiceFunction = nullptr;
+  llvm::Function *getLikelihoodFunction = nullptr;
+  llvm::Function *insertCallFunction = nullptr;
+  llvm::Function *insertChoiceFunction = nullptr;
+  llvm::Function *insertArgumentFunction = nullptr;
+  llvm::Function *insertReturnFunction = nullptr;
+  llvm::Function *insertFunctionFunction = nullptr;
+  llvm::Function *newTraceFunction = nullptr;
+  llvm::Function *freeTraceFunction = nullptr;
+  llvm::Function *hasCallFunction = nullptr;
+  llvm::Function *hasChoiceFunction = nullptr;
+    
+    interfacefns = LLVM.ValueRef[
+        # llvm::Function *getTraceFunction = nullptr;
+        cfunction()
+    ]
+
+    interface = EnzymeCreateTraceInterface(interfacefns...)
+
+    tracef = API.EnzymeCreateTrace(logic, primalf, mode, autodiff, interface)
+    for fname in toremove
+        if haskey(functions(mod), fname)
+            f = functions(mod)[fname]
+            LLVM.API.LLVMRemoveEnumAttributeAtIndex(f, reinterpret(LLVM.API.LLVMAttributeIndex, LLVM.API.LLVMAttributeFunctionIndex), kind(EnumAttribute("returns_twice"; ctx)))
+        end
+    end
+
+    if ts_ctx !== nothing
+@static if VERSION < v"1.9-"
+else
+        if inserted_ts
+            delete!(ctxToThreadSafe, ctx)
+        end
+end
+    end
+
+    LLVM.ModulePassManager() do pm
+        API.AddPreserveNVVMPass!(pm, #=Begin=#false)
+        run!(pm, mod)
+    end
+    API.EnzymeReplaceFunctionImplementation(mod)
+
+    linkage!(tracef, LLVM.API.LLVMExternalLinkage)
+    trace_name = name(tracef)
+
+    if !device_module
+        # Don't restore pointers when we are doing GPU compilation
+        restore_lookups(mod)
+    end
+
+    if parent_job !== tracef
+        reinsert_gcmarker!(adjointf)
+        post_optimze!(mod, target_machine, #=machine=#false)
+    end
+
+
+    if process_module
+        GPUCompiler.process_module!(parent_job, mod)
+    end
+
+    tracef = functions(mod)[trace_name]
+    push!(function_attributes(tracef), EnumAttribute("alwaysinline", 0; ctx=context(mod)))
+
+    for fn in functions(mod)
+        fn == tracef && continue
+        isempty(LLVM.blocks(fn)) && continue
+        linkage!(fn, LLVM.API.LLVMLinkerPrivateLinkage)
+    end
+
+    return mod, (;tracef, compiled=meta.compiled)
+end
+
 ##
 # Thunk
 ##
